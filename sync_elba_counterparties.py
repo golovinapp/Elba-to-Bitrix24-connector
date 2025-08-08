@@ -133,11 +133,15 @@ def ensure_userfields() -> None:
 
 # ------------------------------- Elba API -------------------------------------
 
-def elba_headers() -> Dict[str, str]:
-    return {
+def elba_headers(organization_id: Optional[str] = None) -> Dict[str, str]:
+    headers = {
         "X-Kontur-ApiKey": ELBA_TOKEN or "",
         "Accept": "application/json",
     }
+    if organization_id:
+        # Некоторые эндпоинты Эльбы требуют заголовок с ID организации
+        headers["X-Kontur-OrganizationId"] = organization_id
+    return headers
 
 
 def get_organization_id() -> str:
@@ -159,54 +163,89 @@ def get_organization_id() -> str:
         raise
 
 
-def fetch_all_paginated(url: str, params: Dict[str, Any], item_keys: List[str]) -> List[Dict[str, Any]]:
+def _http_request_json(method: str, url: str, organization_id: Optional[str], params: Dict[str, Any]) -> Dict[str, Any]:
+    if method == "GET":
+        resp = requests.get(url, headers=elba_headers(organization_id), params=params, timeout=(10, 60))
+    else:
+        # POST — часть эндпоинтов /search и некоторые списки требуют тело
+        resp = requests.post(url, headers=elba_headers(organization_id), json=params, timeout=(10, 60))
+    resp.raise_for_status()
+    data = resp.json() if resp.content else {}
+    return data if isinstance(data, dict) else {"items": data}
+
+
+def fetch_all_paginated(url: str, organization_id: Optional[str], params: Dict[str, Any], item_keys: List[str]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
-    skip = 0
+    skip = int(params.get("skip", 0))
     limit = int(params.get("limit", 100))
 
     while True:
         local_params = dict(params)
         local_params.update({"skip": skip, "limit": limit})
-        try:
-            resp = requests.get(url, headers=elba_headers(), params=local_params, timeout=(10, 60))
-            resp.raise_for_status()
-            data = resp.json() or {}
-            # Попробуем разные ключи ответов
-            batch: List[Dict[str, Any]] = []
-            for key in item_keys:
-                if isinstance(data.get(key), list):
-                    batch = data.get(key)  # type: ignore[assignment]
-                    break
-            if not batch and isinstance(data, list):
-                batch = data  # иногда может прийти массив напрямую
 
-            items.extend(batch)
-            logger.debug(f"{url}: получено {len(batch)} (всего {len(items)})")
-            if len(batch) < limit:
-                break
-            skip += limit
-        except requests.exceptions.HTTPError as e:
-            status = getattr(e.response, "status_code", "?")
-            logger.warning(f"{url}: HTTP {status}. Прерываю пагинацию: {e}")
+        batch: List[Dict[str, Any]] = []
+        last_error: Optional[Exception] = None
+
+        for method in ("GET", "POST"):
+            try:
+                data = _http_request_json(method, url, organization_id, local_params)
+                for key in item_keys:
+                    if isinstance(data.get(key), list):
+                        batch = data.get(key)  # type: ignore[assignment]
+                        break
+                if not batch and isinstance(data.get("items"), list):
+                    batch = data.get("items")  # type: ignore[assignment]
+                if not batch and isinstance(data, list):
+                    batch = data  # type: ignore[assignment]
+                if batch:
+                    break
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                status = getattr(e.response, "status_code", "?")
+                logger.warning(f"{url} [{method}]: HTTP {status}. {e}")
+                # Если 405 для GET — пробуем POST, наоборот — тоже
+                continue
+            except Exception as e:
+                last_error = e
+                logger.warning(f"{url} [{method}]: ошибка запроса: {e}")
+                continue
+
+        if not batch:
+            if last_error:
+                logger.debug(f"{url}: не удалось получить пакет. Последняя ошибка: {last_error}")
             break
-        except Exception as e:
-            logger.warning(f"{url}: ошибка запроса: {e}")
+
+        items.extend(batch)
+        logger.debug(f"{url}: получено {len(batch)} (всего {len(items)})")
+        if len(batch) < limit:
             break
+        skip += limit
 
     return items
 
 
 def get_elba_counterparties(organization_id: str) -> List[Dict[str, Any]]:
-    """Пытаемся получить контрагентов по нескольким известным вариантам эндпоинтов."""
+    """Пытаемся получить контрагентов по нескольким вариантам эндпоинтов и методов."""
     candidate_endpoints = [
+        # Варианты с организацией в пути
         f"{ELBA_API_BASE}/organizations/{organization_id}/counterparties",
+        f"{ELBA_API_BASE}/organizations/{organization_id}/counterparties/search",
         f"{ELBA_API_BASE}/organizations/{organization_id}/contractors",
+        f"{ELBA_API_BASE}/organizations/{organization_id}/contractors/search",
+        # Глобальные
         f"{ELBA_API_BASE}/counterparties",
+        f"{ELBA_API_BASE}/counterparties/search",
         f"{ELBA_API_BASE}/contractors",
+        f"{ELBA_API_BASE}/contractors/search",
     ]
 
     for endpoint in candidate_endpoints:
-        items = fetch_all_paginated(endpoint, {"limit": 100}, ["items", "counterparties", "contractors"])
+        items = fetch_all_paginated(
+            endpoint,
+            organization_id,
+            {"limit": 100},
+            ["items", "counterparties", "contractors", "partners", "data"],
+        )
         if items:
             logger.info(f"Контрагенты получены из {endpoint}: {len(items)}")
             return items
@@ -219,16 +258,20 @@ def get_elba_counterparties(organization_id: str) -> List[Dict[str, Any]]:
 
 
 def get_elba_contacts_for_counterparty(organization_id: str, counterparty_id: str) -> List[Dict[str, Any]]:
-    """Пробуем несколько вариантов эндпоинтов для контактных лиц контрагента."""
+    """Пробуем варианты эндпоинтов для контактных лиц контрагента (GET/POST, /search)."""
     candidates = [
         f"{ELBA_API_BASE}/organizations/{organization_id}/counterparties/{counterparty_id}/contacts",
+        f"{ELBA_API_BASE}/organizations/{organization_id}/counterparties/{counterparty_id}/contacts/search",
         f"{ELBA_API_BASE}/organizations/{organization_id}/contractors/{counterparty_id}/contacts",
+        f"{ELBA_API_BASE}/organizations/{organization_id}/contractors/{counterparty_id}/contacts/search",
         f"{ELBA_API_BASE}/counterparties/{counterparty_id}/contacts",
+        f"{ELBA_API_BASE}/counterparties/{counterparty_id}/contacts/search",
         f"{ELBA_API_BASE}/contractors/{counterparty_id}/contacts",
+        f"{ELBA_API_BASE}/contractors/{counterparty_id}/contacts/search",
     ]
 
     for url in candidates:
-        contacts = fetch_all_paginated(url, {"limit": 100}, ["items", "contacts"])
+        contacts = fetch_all_paginated(url, organization_id, {"limit": 100}, ["items", "contacts", "data"])
         if contacts:
             return contacts
     return []
